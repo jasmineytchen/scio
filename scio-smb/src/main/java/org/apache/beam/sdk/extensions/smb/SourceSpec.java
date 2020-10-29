@@ -19,12 +19,14 @@ package org.apache.beam.sdk.extensions.smb;
 
 import java.io.Serializable;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.beam.sdk.coders.CannotProvideCoderException;
 import org.apache.beam.sdk.coders.Coder;
 import org.apache.beam.sdk.coders.Coder.NonDeterministicException;
 import org.apache.beam.sdk.extensions.smb.BucketMetadata.HashType;
-import org.apache.beam.sdk.extensions.smb.BucketMetadataUtil.PartitionMetadata;
 import org.apache.beam.sdk.extensions.smb.SortedBucketSource.BucketedInput;
+import org.apache.beam.sdk.values.TupleTag;
 import org.apache.beam.vendor.guava.v26_0_jre.com.google.common.base.Preconditions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,17 +34,18 @@ import org.slf4j.LoggerFactory;
 class SourceSpec<K> implements Serializable {
   private static Logger LOG = LoggerFactory.getLogger(SourceSpec.class);
 
-  int leastNumBuckets;
-  int greatestNumBuckets;
-  Coder<K> keyCoder;
-  HashType hashType;
+  final int leastNumBuckets;
+  final int greatestNumBuckets;
+  final Coder<K> keyCoder;
+  final HashType hashType;
+  final Map<TupleTag, Integer> bucketsPerSource;
 
-  private SourceSpec(
-      int leastNumBuckets, int greatestNumBuckets, Coder<K> keyCoder, HashType hashType) {
-    this.leastNumBuckets = leastNumBuckets;
-    this.greatestNumBuckets = greatestNumBuckets;
+  SourceSpec(Coder<K> keyCoder, HashType hashType, Map<TupleTag, Integer> bucketsPerSource) {
     this.keyCoder = keyCoder;
     this.hashType = hashType;
+    this.bucketsPerSource = bucketsPerSource;
+    this.leastNumBuckets = bucketsPerSource.values().stream().min(Integer::compareTo).get();
+    this.greatestNumBuckets = bucketsPerSource.values().stream().max(Integer::compareTo).get();
   }
 
   static <KeyT> SourceSpec<KeyT> from(
@@ -78,26 +81,19 @@ class SourceSpec<K> implements Serializable {
       }
     }
 
-    int leastNumBuckets =
+    final Map<TupleTag, Integer> bucketsPerSource =
         sources.stream()
-            .flatMap(source -> source.getPartitionMetadata().values().stream())
-            .map(PartitionMetadata::getNumBuckets)
-            .min(Integer::compareTo)
-            .get();
-
-    int greatestNumBuckets =
-        sources.stream()
-            .flatMap(source -> source.getPartitionMetadata().values().stream())
-            .map(PartitionMetadata::getNumBuckets)
-            .max(Integer::compareTo)
-            .get();
+            .collect(
+                Collectors.toMap(
+                    BucketedInput::getTupleTag,
+                    i -> i.getOrComputeMetadata().getCanonicalMetadata().getNumBuckets()));
 
     Preconditions.checkNotNull(
         finalKeyCoder, "Could not infer coder for key class %s", finalKeyClass);
 
     Preconditions.checkNotNull(hashType, "Could not infer hash type for sources");
 
-    return new SourceSpec<>(leastNumBuckets, greatestNumBuckets, finalKeyCoder, hashType);
+    return new SourceSpec<>(finalKeyCoder, hashType, bucketsPerSource);
   }
 
   int getParallelism(TargetParallelism targetParallelism) {

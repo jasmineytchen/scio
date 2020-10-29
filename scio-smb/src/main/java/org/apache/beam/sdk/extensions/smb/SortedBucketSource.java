@@ -33,10 +33,12 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
 import java.util.NoSuchElementException;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
+import java.util.function.ToLongFunction;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -243,8 +245,8 @@ public class SortedBucketSource<FinalKeyT> extends BoundedSource<KV<FinalKeyT, C
         .collect(Collectors.toList());
   }
 
-  static int getFanout(
-      SourceSpec sourceSpec,
+  static <K> int getFanout(
+      SourceSpec<K> sourceSpec,
       int effectiveParallelism,
       TargetParallelism targetParallelism,
       long estimatedSizeBytes,
@@ -260,16 +262,32 @@ public class SortedBucketSource<FinalKeyT> extends BoundedSource<KV<FinalKeyT, C
     }
     if (!targetParallelism.isAuto()) {
       return sourceSpec.getParallelism(targetParallelism);
+    } else if (sourceSpec.leastNumBuckets == greatestNumBuckets) {
+      return sourceSpec.leastNumBuckets;
     } else {
-      int fanout = (int) Math.round(estimatedSizeBytes / (desiredSizeBytes * 1.0));
+      // Compute a possible fanout based on the most frequently occurring bucket count among sources
+      int bucketFrequencyBasedFanout =
+          sourceSpec.bucketsPerSource.entrySet().stream()
+              .collect(Collectors.groupingBy(Map.Entry::getValue, Collectors.counting()))
+              .entrySet()
+              .stream()
+              .max(
+                  // Compare first by most frequently-occurring bucket size, then break
+                  // tie by choosing higher number
+                  Comparator.comparingLong((ToLongFunction<Entry<Integer, Long>>) Entry::getValue)
+                      .thenComparingInt(Entry::getKey))
+              .get()
+              .getKey();
 
-      if (fanout <= 1) {
-        LOG.info("Desired byte size is <= total input size, can't split further.");
-        return 1;
-      }
+      // Compute a possible fanout based on the desired byte size from Dataflow relative to
+      // the sources' byte size, rounded up to the nearest power of 2
+      int byteSizeBasedFanout =
+          Integer.highestOneBit((int) Math.round(estimatedSizeBytes / (desiredSizeBytes * 1.0)) - 1)
+              * 2;
+      byteSizeBasedFanout = Math.min(byteSizeBasedFanout, greatestNumBuckets);
 
-      // round up to nearest power of 2, bounded by greatest # of buckets
-      return Math.min(Integer.highestOneBit(fanout - 1) * 2, greatestNumBuckets);
+      // Take the higher number
+      return Math.max(byteSizeBasedFanout, bucketFrequencyBasedFanout);
     }
   }
 
@@ -341,12 +359,7 @@ public class SortedBucketSource<FinalKeyT> extends BoundedSource<KV<FinalKeyT, C
       resultSchema = BucketedInput.schemaOf(sources);
       tupleTags = resultSchema.getTupleTagList();
 
-      this.bucketsPerSource =
-          sources.stream()
-              .collect(
-                  Collectors.toMap(
-                      BucketedInput::getTupleTag,
-                      i -> i.getOrComputeMetadata().getCanonicalMetadata().getNumBuckets()));
+      this.bucketsPerSource = sourceSpec.bucketsPerSource;
     }
 
     @Override
@@ -519,7 +532,7 @@ public class SortedBucketSource<FinalKeyT> extends BoundedSource<KV<FinalKeyT, C
       return getOrComputeMetadata().getPartitionMetadata();
     }
 
-    private SourceMetadata<K, V> getOrComputeMetadata() {
+    SourceMetadata<K, V> getOrComputeMetadata() {
       if (sourceMetadata == null) {
         sourceMetadata =
             BucketMetadataUtil.get().getSourceMetadata(inputDirectories, filenameSuffix);

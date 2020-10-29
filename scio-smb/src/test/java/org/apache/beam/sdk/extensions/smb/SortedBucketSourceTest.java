@@ -39,6 +39,8 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 import org.apache.beam.sdk.PipelineResult;
+import org.apache.beam.sdk.coders.StringUtf8Coder;
+import org.apache.beam.sdk.extensions.smb.BucketMetadata.HashType;
 import org.apache.beam.sdk.extensions.smb.FileOperations.Writer;
 import org.apache.beam.sdk.extensions.smb.SMBFilenamePolicy.FileAssignment;
 import org.apache.beam.sdk.io.FileSystems;
@@ -428,7 +430,7 @@ public class SortedBucketSourceTest {
 
   @SuppressWarnings("unchecked")
   @Test
-  public void testSourceSplit() throws Exception {
+  public void testSourceSizeEstimation() throws Exception {
     writeSmbSourceWithBytes(120, 4, 1, lhsPolicy);
     writeSmbSourceWithBytes(60, 1, 2, rhsPolicy);
 
@@ -449,17 +451,37 @@ public class SortedBucketSourceTest {
         new SortedBucketSource(String.class, inputs, TargetParallelism.auto());
 
     Assert.assertEquals(180, source.getEstimatedSizeBytes(PipelineOptionsFactory.create()));
+  }
 
-    final List<SortedBucketSource<String>> splitSources =
-        source.split(
-            (long) (50 / DESIRED_SIZE_BYTES_ADJUSTMENT_FACTOR), PipelineOptionsFactory.create());
-    splitSources.sort(Comparator.comparingInt(SortedBucketSource::getBucketOffset));
+  @Test
+  public void testGetFanoutMostCommonBuckets() {
+    final SourceSpec<String> sourceSpec =
+        new SourceSpec<>(
+            StringUtf8Coder.of(),
+            HashType.MURMUR3_32,
+            ImmutableMap.of(
+                new TupleTag("source1"), 16,
+                new TupleTag("source2"), 16,
+                new TupleTag("source3"), 8,
+                new TupleTag("source4"), 8)); // Tie between 8 and 16, so pick the higher number
 
-    Assert.assertEquals(4, splitSources.size());
-    Assert.assertEquals(0, splitSources.get(0).getBucketOffset());
-    Assert.assertEquals(1, splitSources.get(1).getBucketOffset());
-    Assert.assertEquals(2, splitSources.get(2).getBucketOffset());
-    Assert.assertEquals(3, splitSources.get(3).getBucketOffset());
+    Assert.assertEquals(
+        16, SortedBucketSource.getFanout(sourceSpec, 1, TargetParallelism.auto(), 160, 20, 1));
+  }
+
+  @Test
+  public void testGetFanoutDesiredByteSize() {
+    final SourceSpec<String> sourceSpec =
+        new SourceSpec<>(
+            StringUtf8Coder.of(),
+            HashType.MURMUR3_32,
+            ImmutableMap.of(
+                new TupleTag("source1"), 4,
+                new TupleTag("source2"), 4,
+                new TupleTag("source3"), 16));
+
+    Assert.assertEquals(
+        8, SortedBucketSource.getFanout(sourceSpec, 1, TargetParallelism.auto(), 160, 20, 1));
   }
 
   @Test
